@@ -4,7 +4,9 @@
  * Target: Qualcomm Snapdragon 845 (SDM845) - Xiaomi Poco F1 (beryllium)
  *
  * Provides dynamic CPU frequency clamping and core management to maximize
- * battery endurance while retaining responsive performance.
+ * battery endurance while retaining responsive performance. User-facing
+ * configuration is intentionally kept in the userspace batsave helper;
+ * the kernel module only validates and applies bounded state.
  *
  * Full clean rollback on unload (rmmod) restoring original factory frequencies
  * and hotplugged cores.
@@ -16,11 +18,12 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/cpufreq.h>
+#include <linux/pm_qos.h>
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/mutex.h>
-#include <linux/slab.h>
 #include <linux/atomic.h>
+#include <linux/limits.h>
 
 enum bs_profile {
 	PROFILE_PASSTHROUGH = 0, /* Limits bypass / stock monitoring */
@@ -46,7 +49,7 @@ struct bs_config {
 	unsigned int little_min_freq; /* kHz */
 	unsigned int big_max_freq;    /* kHz */
 	unsigned int big_min_freq;    /* kHz */
-	unsigned int big_cores_online; /* 0..4 big cores */
+	unsigned int big_cores_online; /* 1..4 big cores */
 };
 
 /* Default to Balanced Powersave */
@@ -64,6 +67,9 @@ static cpumask_t orig_online_cpus;
 static cpumask_t bs_offlined_cpus;
 static DEFINE_MUTEX(bs_lock);
 static atomic_t adjustments_count = ATOMIC_INIT(0);
+static struct freq_qos_request bs_max_qos_reqs[NR_CPUS];
+static struct freq_qos_request bs_min_qos_reqs[NR_CPUS];
+static DECLARE_BITMAP(bs_qos_added, NR_CPUS);
 
 /* SDM845 Big cluster cores: CPU 4, 5, 6, 7 */
 static const unsigned int big_cpu_list[4] = {4, 5, 6, 7};
@@ -107,14 +113,15 @@ static void apply_preset_values(int prof)
 
 /*
  * Adjust Big cluster CPU online states based on big_cores_online setting.
- * Must NOT be called with cpu_hotplug_lock / cpus_read_lock held.
+ * Must NOT be called with the CPU hotplug read lock held.
  */
 static void bs_sync_cores_locked(void)
 {
-	unsigned int target = cfg.big_cores_online;
+	unsigned int target = READ_ONCE(cfg.big_cores_online);
 	int i;
 
-	if (!cfg.enabled || cfg.profile == PROFILE_PASSTHROUGH)
+	if (!READ_ONCE(cfg.enabled) ||
+	    READ_ONCE(cfg.profile) == PROFILE_PASSTHROUGH)
 		target = 4;
 
 	if (target > 4)
@@ -130,14 +137,14 @@ static void bs_sync_cores_locked(void)
 			/* Should be online */
 			if (!cpu_online(cpu)) {
 				pr_info("Bringing CPU%u online\n", cpu);
-				if (cpu_up(cpu) == 0)
+				if (add_cpu(cpu) == 0)
 					cpumask_clear_cpu(cpu, &bs_offlined_cpus);
 			}
 		} else {
 			/* Should be offlined */
 			if (cpu_online(cpu)) {
 				pr_info("Offlining CPU%u for battery optimization\n", cpu);
-				if (cpu_down(cpu) == 0)
+				if (remove_cpu(cpu) == 0)
 					cpumask_set_cpu(cpu, &bs_offlined_cpus);
 			}
 		}
@@ -150,12 +157,67 @@ static void bs_sync_cores_locked(void)
 static void bs_update_policies_locked(void)
 {
 	unsigned int cpu;
+	struct cpufreq_policy *policy;
+	unsigned int max_freq, min_freq;
+	int ret;
 
-	get_online_cpus();
+	cpus_read_lock();
 	for_each_online_cpu(cpu) {
-		cpufreq_update_policy(cpu);
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+
+		max_freq = (policy->cpu >= 4) ? cfg.big_max_freq :
+						   cfg.little_max_freq;
+		min_freq = (policy->cpu >= 4) ? cfg.big_min_freq :
+						   cfg.little_min_freq;
+		if (!cfg.enabled || cfg.profile == PROFILE_PASSTHROUGH)
+			max_freq = min_freq = 0;
+
+		if (max_freq) {
+			if (!test_bit(cpu, bs_qos_added)) {
+				ret = freq_qos_add_request(&policy->constraints,
+							   &bs_max_qos_reqs[cpu],
+							   FREQ_QOS_MAX, max_freq);
+				if (ret) {
+					pr_err("Failed to add CPU%u max-frequency constraint: %d\n",
+					       cpu, ret);
+					cpufreq_cpu_put(policy);
+					continue;
+				}
+				ret = freq_qos_add_request(&policy->constraints,
+							   &bs_min_qos_reqs[cpu],
+							   FREQ_QOS_MIN, min_freq);
+				if (ret) {
+					freq_qos_remove_request(&bs_max_qos_reqs[cpu]);
+					pr_err("Failed to add CPU%u min-frequency constraint: %d\n",
+					       cpu, ret);
+					cpufreq_cpu_put(policy);
+					continue;
+				}
+				set_bit(cpu, bs_qos_added);
+			} else {
+				ret = freq_qos_update_request(&bs_max_qos_reqs[cpu],
+							      max_freq);
+				if (ret)
+					pr_err("Failed to update CPU%u max-frequency constraint: %d\n",
+					       cpu, ret);
+				ret = freq_qos_update_request(&bs_min_qos_reqs[cpu],
+							      min_freq);
+				if (ret)
+					pr_err("Failed to update CPU%u min-frequency constraint: %d\n",
+					       cpu, ret);
+			}
+			atomic_inc(&adjustments_count);
+		} else if (test_bit(cpu, bs_qos_added)) {
+			freq_qos_remove_request(&bs_min_qos_reqs[cpu]);
+			freq_qos_remove_request(&bs_max_qos_reqs[cpu]);
+			clear_bit(cpu, bs_qos_added);
+		}
+
+		cpufreq_cpu_put(policy);
 	}
-	put_online_cpus();
+	cpus_read_unlock();
 }
 
 static void bs_apply_state(void)
@@ -165,53 +227,6 @@ static void bs_apply_state(void)
 	bs_update_policies_locked();
 	mutex_unlock(&bs_lock);
 }
-
-/*
- * CPUFREQ_POLICY_NOTIFIER callback: clamps frequency during policy re-evaluations.
- */
-static int bs_cpufreq_notifier(struct notifier_block *nb, unsigned long val,
-			       void *data)
-{
-	struct cpufreq_policy *policy = data;
-	unsigned int target_max, target_min;
-	bool is_big;
-
-	if (val != CPUFREQ_ADJUST)
-		return NOTIFY_OK;
-
-	if (!cfg.enabled || cfg.profile == PROFILE_PASSTHROUGH)
-		return NOTIFY_OK;
-
-	/* SDM845 Little cluster: CPU 0-3; Big cluster: CPU 4-7 */
-	is_big = (policy->cpu >= 4);
-
-	if (is_big) {
-		target_max = cfg.big_max_freq;
-		target_min = cfg.big_min_freq;
-	} else {
-		target_max = cfg.little_max_freq;
-		target_min = cfg.little_min_freq;
-	}
-
-	if (target_max > 0) {
-		/* Guarantee sanity within hardware capabilities */
-		if (target_min < policy->cpuinfo.min_freq)
-			target_min = policy->cpuinfo.min_freq;
-		if (target_max > policy->cpuinfo.max_freq)
-			target_max = policy->cpuinfo.max_freq;
-		if (target_min > target_max)
-			target_min = target_max;
-
-		cpufreq_verify_within_limits(policy, target_min, target_max);
-		atomic_inc(&adjustments_count);
-	}
-
-	return NOTIFY_OK;
-}
-
-static struct notifier_block bs_cpufreq_nb = {
-	.notifier_call = bs_cpufreq_notifier,
-};
 
 /*****************************************************************************
  * Sysfs Module Parameter Callbacks
@@ -242,7 +257,7 @@ static int param_set_profile(const char *val, const struct kernel_param *kp)
 
 static int param_get_profile(char *buffer, const struct kernel_param *kp)
 {
-	int p = cfg.profile;
+	int p = READ_ONCE(cfg.profile);
 
 	if (p < 0 || p >= PROFILE_MAX)
 		p = PROFILE_CUSTOM;
@@ -279,7 +294,7 @@ static int param_set_enabled(const char *val, const struct kernel_param *kp)
 
 static int param_get_enabled(char *buffer, const struct kernel_param *kp)
 {
-	return scnprintf(buffer, PAGE_SIZE, "%d\n", cfg.enabled ? 1 : 0);
+	return scnprintf(buffer, PAGE_SIZE, "%d\n", READ_ONCE(cfg.enabled) ? 1 : 0);
 }
 
 static const struct kernel_param_ops enabled_ops = {
@@ -298,8 +313,14 @@ static int param_set_little_max(const char *val, const struct kernel_param *kp)
 	ret = kstrtouint(val, 0, &freq);
 	if (ret)
 		return ret;
+	if (!freq)
+		return -EINVAL;
 
 	mutex_lock(&bs_lock);
+	if (freq < cfg.little_min_freq) {
+		mutex_unlock(&bs_lock);
+		return -EINVAL;
+	}
 	cfg.little_max_freq = freq;
 	cfg.profile = PROFILE_CUSTOM;
 	mutex_unlock(&bs_lock);
@@ -310,7 +331,12 @@ static int param_set_little_max(const char *val, const struct kernel_param *kp)
 
 static int param_get_little_max(char *buffer, const struct kernel_param *kp)
 {
-	return scnprintf(buffer, PAGE_SIZE, "%u kHz\n", cfg.little_max_freq);
+	unsigned int value;
+
+	mutex_lock(&bs_lock);
+	value = cfg.little_max_freq;
+	mutex_unlock(&bs_lock);
+	return scnprintf(buffer, PAGE_SIZE, "%u kHz\n", value);
 }
 
 static const struct kernel_param_ops little_max_ops = {
@@ -331,6 +357,10 @@ static int param_set_little_min(const char *val, const struct kernel_param *kp)
 		return ret;
 
 	mutex_lock(&bs_lock);
+	if (!cfg.little_max_freq || freq > cfg.little_max_freq) {
+		mutex_unlock(&bs_lock);
+		return -EINVAL;
+	}
 	cfg.little_min_freq = freq;
 	cfg.profile = PROFILE_CUSTOM;
 	mutex_unlock(&bs_lock);
@@ -341,7 +371,12 @@ static int param_set_little_min(const char *val, const struct kernel_param *kp)
 
 static int param_get_little_min(char *buffer, const struct kernel_param *kp)
 {
-	return scnprintf(buffer, PAGE_SIZE, "%u kHz\n", cfg.little_min_freq);
+	unsigned int value;
+
+	mutex_lock(&bs_lock);
+	value = cfg.little_min_freq;
+	mutex_unlock(&bs_lock);
+	return scnprintf(buffer, PAGE_SIZE, "%u kHz\n", value);
 }
 
 static const struct kernel_param_ops little_min_ops = {
@@ -360,8 +395,14 @@ static int param_set_big_max(const char *val, const struct kernel_param *kp)
 	ret = kstrtouint(val, 0, &freq);
 	if (ret)
 		return ret;
+	if (!freq)
+		return -EINVAL;
 
 	mutex_lock(&bs_lock);
+	if (freq < cfg.big_min_freq) {
+		mutex_unlock(&bs_lock);
+		return -EINVAL;
+	}
 	cfg.big_max_freq = freq;
 	cfg.profile = PROFILE_CUSTOM;
 	mutex_unlock(&bs_lock);
@@ -372,7 +413,12 @@ static int param_set_big_max(const char *val, const struct kernel_param *kp)
 
 static int param_get_big_max(char *buffer, const struct kernel_param *kp)
 {
-	return scnprintf(buffer, PAGE_SIZE, "%u kHz\n", cfg.big_max_freq);
+	unsigned int value;
+
+	mutex_lock(&bs_lock);
+	value = cfg.big_max_freq;
+	mutex_unlock(&bs_lock);
+	return scnprintf(buffer, PAGE_SIZE, "%u kHz\n", value);
 }
 
 static const struct kernel_param_ops big_max_ops = {
@@ -393,6 +439,10 @@ static int param_set_big_min(const char *val, const struct kernel_param *kp)
 		return ret;
 
 	mutex_lock(&bs_lock);
+	if (!cfg.big_max_freq || freq > cfg.big_max_freq) {
+		mutex_unlock(&bs_lock);
+		return -EINVAL;
+	}
 	cfg.big_min_freq = freq;
 	cfg.profile = PROFILE_CUSTOM;
 	mutex_unlock(&bs_lock);
@@ -403,7 +453,12 @@ static int param_set_big_min(const char *val, const struct kernel_param *kp)
 
 static int param_get_big_min(char *buffer, const struct kernel_param *kp)
 {
-	return scnprintf(buffer, PAGE_SIZE, "%u kHz\n", cfg.big_min_freq);
+	unsigned int value;
+
+	mutex_lock(&bs_lock);
+	value = cfg.big_min_freq;
+	mutex_unlock(&bs_lock);
+	return scnprintf(buffer, PAGE_SIZE, "%u kHz\n", value);
 }
 
 static const struct kernel_param_ops big_min_ops = {
@@ -413,7 +468,7 @@ static const struct kernel_param_ops big_min_ops = {
 module_param_cb(big_min_freq, &big_min_ops, &cfg.big_min_freq, 0644);
 MODULE_PARM_DESC(big_min_freq, "Minimum frequency for Big cluster in kHz");
 
-/* Big cores online count (0..4) */
+/* Big cores online count (1..4); keep at least one performance core available. */
 static int param_set_big_cores(const char *val, const struct kernel_param *kp)
 {
 	unsigned int count;
@@ -423,7 +478,7 @@ static int param_set_big_cores(const char *val, const struct kernel_param *kp)
 	if (ret)
 		return ret;
 
-	if (count > 4)
+	if (count < 1 || count > 4)
 		return -EINVAL;
 
 	mutex_lock(&bs_lock);
@@ -437,7 +492,12 @@ static int param_set_big_cores(const char *val, const struct kernel_param *kp)
 
 static int param_get_big_cores(char *buffer, const struct kernel_param *kp)
 {
-	return scnprintf(buffer, PAGE_SIZE, "%u (out of 4 big cores)\n", cfg.big_cores_online);
+	unsigned int value;
+
+	mutex_lock(&bs_lock);
+	value = cfg.big_cores_online;
+	mutex_unlock(&bs_lock);
+	return scnprintf(buffer, PAGE_SIZE, "%u (out of 4 big cores)\n", value);
 }
 
 static const struct kernel_param_ops big_cores_ops = {
@@ -445,14 +505,18 @@ static const struct kernel_param_ops big_cores_ops = {
 	.get = param_get_big_cores,
 };
 module_param_cb(big_cores_online, &big_cores_ops, &cfg.big_cores_online, 0644);
-MODULE_PARM_DESC(big_cores_online, "Number of Big cluster cores online (0..4)");
+MODULE_PARM_DESC(big_cores_online, "Number of Big cluster cores online (1..4)");
 
 /* Read-only status report */
 static int param_get_status(char *buffer, const struct kernel_param *kp)
 {
-	int p = cfg.profile;
+	int p;
 	unsigned int little_online = 0, big_online = 0;
 	int i, len = 0;
+
+	mutex_lock(&bs_lock);
+	p = cfg.profile;
+	mutex_unlock(&bs_lock);
 
 	if (p < 0 || p >= PROFILE_MAX)
 		p = PROFILE_CUSTOM;
@@ -482,13 +546,13 @@ static int param_get_status(char *buffer, const struct kernel_param *kp)
 			 "   Target Limits      : %u kHz - %u kHz\n"
 			 "   Offlined by module : CPU4=%s CPU5=%s CPU6=%s CPU7=%s\n"
 			 "========================================\n",
-			 cfg.enabled ? "ENABLED (Active)" : "DISABLED (Bypass)",
+			 READ_ONCE(cfg.enabled) ? "ENABLED (Active)" : "DISABLED (Bypass)",
 			 p, profile_names[p],
 			 atomic_read(&adjustments_count),
 			 little_online,
-			 cfg.little_min_freq, cfg.little_max_freq,
+			 READ_ONCE(cfg.little_min_freq), READ_ONCE(cfg.little_max_freq),
 			 big_online,
-			 cfg.big_min_freq, cfg.big_max_freq,
+			 READ_ONCE(cfg.big_min_freq), READ_ONCE(cfg.big_max_freq),
 			 cpumask_test_cpu(4, &bs_offlined_cpus) ? "OFF" : "ON",
 			 cpumask_test_cpu(5, &bs_offlined_cpus) ? "OFF" : "ON",
 			 cpumask_test_cpu(6, &bs_offlined_cpus) ? "OFF" : "ON",
@@ -509,8 +573,6 @@ MODULE_PARM_DESC(status, "Read-only summary of battery saver operational state a
 
 static int __init battery_saver_init(void)
 {
-	int ret;
-
 	pr_info("Initializing Adaptive Battery Saver for SDM845...\n");
 
 	/* Snapshot original online CPU mask for exact rollback upon unload */
@@ -519,13 +581,6 @@ static int __init battery_saver_init(void)
 
 	/* Initialize default preset configuration */
 	apply_preset_values(cfg.profile);
-
-	/* Register cpufreq policy notifier */
-	ret = cpufreq_register_notifier(&bs_cpufreq_nb, CPUFREQ_POLICY_NOTIFIER);
-	if (ret) {
-		pr_err("Failed to register cpufreq policy notifier (err: %d)\n", ret);
-		return ret;
-	}
 
 	/* Apply initial settings and enforce limits */
 	bs_apply_state();
@@ -543,26 +598,34 @@ static void __exit battery_saver_exit(void)
 
 	pr_info("Unloading module, performing clean rollback to stock state...\n");
 
-	/* 1. Unregister policy notifier so no more limit clamping takes place */
-	cpufreq_unregister_notifier(&bs_cpufreq_nb, CPUFREQ_POLICY_NOTIFIER);
+	/* 1. Remove QoS constraints before restoring stock policies. */
+	mutex_lock(&bs_lock);
+	for_each_possible_cpu(cpu) {
+		if (test_bit(cpu, bs_qos_added)) {
+			freq_qos_remove_request(&bs_min_qos_reqs[cpu]);
+			freq_qos_remove_request(&bs_max_qos_reqs[cpu]);
+			clear_bit(cpu, bs_qos_added);
+		}
+	}
+	mutex_unlock(&bs_lock);
 
 	/* 2. Restore all CPUs that were online before module loaded */
 	mutex_lock(&bs_lock);
 	for_each_possible_cpu(cpu) {
 		if (cpumask_test_cpu(cpu, &orig_online_cpus) && !cpu_online(cpu)) {
 			pr_info("Restoring CPU%u to online state\n", cpu);
-			cpu_up(cpu);
+			add_cpu(cpu);
 		}
 	}
 	cpumask_clear(&bs_offlined_cpus);
 	mutex_unlock(&bs_lock);
 
 	/* 3. Re-evaluate policy across all online CPUs to restore stock frequencies */
-	get_online_cpus();
+	cpus_read_lock();
 	for_each_online_cpu(cpu) {
 		cpufreq_update_policy(cpu);
 	}
-	put_online_cpus();
+	cpus_read_unlock();
 
 	pr_info("Rollback complete. Stock CPU limits and core states restored.\n");
 }

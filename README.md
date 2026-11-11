@@ -7,8 +7,9 @@ An in-kernel power optimization module for Qualcomm Snapdragon 845 (Xiaomi Poco 
 ## Key Features
 
 - **Zero Permanent Footprint**: When unloaded (`rmmod battery_saver`), it unhooks all notifiers, restores all offlined CPU cores, and commands `cpufreq` to recalculate policies back to original stock limits.
-- **Dynamic Policy Interception**: Uses `CPUFREQ_POLICY_NOTIFIER` (`CPUFREQ_ADJUST`) to clamp frequencies directly within the kernel governor cycle, overriding aggressive boost attempts without breaking governors.
+- **Modern cpufreq QoS Enforcement**: Uses per-policy `freq_qos` min/max constraints, allowing governors to operate normally while enforcing safe bounds.
 - **Intelligent Big Core Offlining**: Safely hotplugs high-power Gold cores (Cores 4-7) while guaranteeing Little cluster cores (Cores 0-3) remain available for zero system lockups.
+- **Safety Validation**: Rejects invalid frequency ranges, prevents zero Big cores, and requires root for all mutating operations.
 - **Instant Sysfs Customizability**: Fine-tune individual parameters or switch presets on the fly via `/sys/module/battery_saver/parameters/`.
 
 ---
@@ -84,6 +85,33 @@ echo 1363200 > /sys/module/battery_saver/parameters/big_max_freq
 echo 2 > /sys/module/battery_saver/parameters/big_cores_online
 ```
 
+### 5. `batsave` Command
+
+The kernel cannot safely create an executable in a user's `PATH` while loading.
+The repository therefore ships a small, auditable userspace wrapper. Install it
+alongside the module:
+
+```bash
+make -C /lib/modules/$(uname -r)/build M="$PWD" modules
+sudo make install-batsave
+```
+
+After installation, `batsave` is available whenever the module is loaded:
+
+```bash
+batsave load
+batsave status
+batsave profile balanced
+batsave set little_max_freq 1056000
+batsave disable
+batsave enable
+batsave unload
+```
+
+`batsave` accepts only known parameters, validates numeric values, and requires
+root privileges for changes. Set `BATTSAVE_PARAM_DIR` only for testing against
+an alternate sysfs fixture.
+
 ---
 
 ## Load & Unload Lifecycle
@@ -100,6 +128,7 @@ modprobe battery_saver
 rmmod battery_saver
 ```
 Upon `rmmod`:
-1. The cpufreq policy notifier unregisters immediately.
-2. Any CPU cores offlined by the module are brought back online via `cpu_up`.
+1. All module-owned `freq_qos` constraints are removed.
+2. Any CPU cores offlined by the module are brought back online via the modern
+   CPU hotplug API.
 3. All online CPU policies are re-evaluated, immediately restoring full factory frequency ranges and governor boosts.
